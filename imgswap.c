@@ -13,8 +13,6 @@
 #include <webp/decode.h>
 #include <webp/encode.h>
 
-
-
 typedef enum {
     FORMAT_UNKNOWN = 0,
     FORMAT_JPEG,
@@ -32,11 +30,17 @@ typedef struct {
 } Image;
 
 static void print_usage(const char *program_name) {
-    fprintf(stderr, "usage: %s [-q quality] input output\n", program_name);
+
+    fprintf(stderr, "supported formats: jpg jpeg png webp tif tiff gif heic heif\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "usage: %s [-q quality] [-r WIDTHxHEIGHT] [-s] input output\n", program_name);
     fprintf(stderr, "       %s -h\n", program_name);
     fprintf(stderr, "\n");
-    fprintf(stderr, "supported formats: jpg jpeg png webp tif tiff gif heic heif\n");
+    fprintf(stderr, "\n");
     fprintf(stderr, "quality range: 1-100 (used by jpg webp heic output)\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "-r, --resize WxH   resize output image to exact width x height\n");
+    fprintf(stderr, "-s, --shrink       reduce output file size using more aggressive compression\n");
 }
 
 static int parse_quality(const char *value, int *quality_out) {
@@ -48,6 +52,37 @@ static int parse_quality(const char *value, int *quality_out) {
     }
 
     *quality_out = (int)parsed;
+    return 1;
+}
+
+static int parse_resize(const char *value, int *width_out, int *height_out) {
+    char *x_pos;
+    char *end_w = NULL;
+    char *end_h = NULL;
+    long w;
+    long h;
+
+    if (!value || *value == '\0') {
+        return 0;
+    }
+
+    x_pos = strchr(value, 'x');
+    if (!x_pos) {
+        x_pos = strchr(value, 'X');
+    }
+    if (!x_pos) {
+        return 0;
+    }
+
+    w = strtol(value, &end_w, 10);
+    h = strtol(x_pos + 1, &end_h, 10);
+
+    if (end_w != x_pos || *end_h != '\0' || w <= 0 || h <= 0 || w > 100000 || h > 100000) {
+        return 0;
+    }
+
+    *width_out = (int)w;
+    *height_out = (int)h;
     return 1;
 }
 
@@ -86,6 +121,10 @@ static void image_free(Image *img) {
         free(img->rgba);
         img->rgba = NULL;
     }
+    if (img) {
+        img->width = 0;
+        img->height = 0;
+    }
 }
 
 static int alpha_blend_white(unsigned char c, unsigned char a) {
@@ -94,6 +133,50 @@ static int alpha_blend_white(unsigned char c, unsigned char a) {
 
 static void print_heif_error(const char *op, struct heif_error err) {
     fprintf(stderr, "%s: %s\n", op, err.message ? err.message : "unknown error");
+}
+
+static int resize_image(const Image *src, Image *dst, int new_width, int new_height) {
+    int x;
+    int y;
+
+    if (!src || !src->rgba || new_width <= 0 || new_height <= 0) {
+        return 0;
+    }
+
+    dst->width = new_width;
+    dst->height = new_height;
+    dst->rgba = malloc((size_t)new_width * (size_t)new_height * 4u);
+    if (!dst->rgba) {
+        fprintf(stderr, "resize: out of memory\n");
+        return 0;
+    }
+
+    for (y = 0; y < new_height; ++y) {
+        int src_y = (int)((long long)y * src->height / new_height);
+        if (src_y >= src->height) {
+            src_y = src->height - 1;
+        }
+
+        for (x = 0; x < new_width; ++x) {
+            int src_x = (int)((long long)x * src->width / new_width);
+            size_t src_idx;
+            size_t dst_idx;
+
+            if (src_x >= src->width) {
+                src_x = src->width - 1;
+            }
+
+            src_idx = ((size_t)src_y * (size_t)src->width + (size_t)src_x) * 4u;
+            dst_idx = ((size_t)y * (size_t)new_width + (size_t)x) * 4u;
+
+            dst->rgba[dst_idx + 0] = src->rgba[src_idx + 0];
+            dst->rgba[dst_idx + 1] = src->rgba[src_idx + 1];
+            dst->rgba[dst_idx + 2] = src->rgba[src_idx + 2];
+            dst->rgba[dst_idx + 3] = src->rgba[src_idx + 3];
+        }
+    }
+
+    return 1;
 }
 
 static int decode_jpeg(const char *path, Image *out) {
@@ -158,13 +241,18 @@ static int decode_jpeg(const char *path, Image *out) {
     return 1;
 }
 
-static int encode_jpeg(const char *path, const Image *img, int quality) {
+static int encode_jpeg(const char *path, const Image *img, int quality, int shrink) {
     FILE *fp = fopen(path, "wb");
     struct jpeg_compress_struct cinfo;
     struct jpeg_error_mgr jerr;
     JSAMPROW row_pointer[1];
     unsigned char *row = NULL;
     int x;
+    int effective_quality = quality;
+
+    if (shrink && effective_quality > 75) {
+        effective_quality = 75;
+    }
 
     if (!fp) {
         fprintf(stderr, "open %s: %s\n", path, strerror(errno));
@@ -181,7 +269,13 @@ static int encode_jpeg(const char *path, const Image *img, int quality) {
     cinfo.in_color_space = JCS_RGB;
 
     jpeg_set_defaults(&cinfo);
-    jpeg_set_quality(&cinfo, quality, TRUE);
+    jpeg_set_quality(&cinfo, effective_quality, TRUE);
+
+    if (shrink) {
+        cinfo.optimize_coding = TRUE;
+        cinfo.dct_method = JDCT_FASTEST;
+    }
+
     jpeg_start_compress(&cinfo, TRUE);
 
     row = malloc((size_t)img->width * 3u);
@@ -309,7 +403,7 @@ static int decode_png(const char *path, Image *out) {
     return 1;
 }
 
-static int encode_png(const char *path, const Image *img) {
+static int encode_png(const char *path, const Image *img, int shrink) {
     FILE *fp = fopen(path, "wb");
     png_structp png = NULL;
     png_infop info = NULL;
@@ -341,6 +435,14 @@ static int encode_png(const char *path, const Image *img) {
     }
 
     png_init_io(png, fp);
+
+    if (shrink) {
+        png_set_compression_level(png, 9);
+        png_set_compression_mem_level(png, 9);
+        png_set_compression_strategy(png, PNG_Z_DEFAULT_STRATEGY);
+        png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_ALL_FILTERS);
+    }
+
     png_set_IHDR(
         png,
         info,
@@ -434,17 +536,22 @@ static int decode_webp(const char *path, Image *out) {
     return 1;
 }
 
-static int encode_webp(const char *path, const Image *img, int quality) {
+static int encode_webp(const char *path, const Image *img, int quality, int shrink) {
     uint8_t *out_data = NULL;
     size_t out_size;
     FILE *fp;
+    float effective_quality = (float)quality;
+
+    if (shrink && effective_quality > 70.0f) {
+        effective_quality = 70.0f;
+    }
 
     out_size = WebPEncodeRGBA(
         img->rgba,
         img->width,
         img->height,
         img->width * 4,
-        (float)quality,
+        effective_quality,
         &out_data
     );
 
@@ -527,7 +634,7 @@ static int decode_tiff(const char *path, Image *out) {
     return 1;
 }
 
-static int encode_tiff(const char *path, const Image *img) {
+static int encode_tiff(const char *path, const Image *img, int shrink) {
     TIFF *tif = TIFFOpen(path, "w");
     uint16_t extrasamples = EXTRASAMPLE_ASSOCALPHA;
     int y;
@@ -544,7 +651,14 @@ static int encode_tiff(const char *path, const Image *img) {
     TIFFSetField(tif, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
     TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
     TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_RGB);
-    TIFFSetField(tif, TIFFTAG_COMPRESSION, COMPRESSION_LZW);
+
+    if (shrink) {
+        TIFFSetField(tif, TIFFTAG_COMPRESSION, COMPRESSION_ADOBE_DEFLATE);
+        TIFFSetField(tif, TIFFTAG_PREDICTOR, 2);
+    } else {
+        TIFFSetField(tif, TIFFTAG_COMPRESSION, COMPRESSION_LZW);
+    }
+
     TIFFSetField(tif, TIFFTAG_EXTRASAMPLES, 1, &extrasamples);
     TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, TIFFDefaultStripSize(tif, (uint32_t)-1));
 
@@ -827,7 +941,7 @@ static int decode_heic(const char *path, Image *out) {
     return 1;
 }
 
-static int encode_heic(const char *path, const Image *img, int quality) {
+static int encode_heic(const char *path, const Image *img, int quality, int shrink) {
     struct heif_context *ctx = NULL;
     struct heif_image *image = NULL;
     struct heif_encoder *encoder = NULL;
@@ -836,6 +950,11 @@ static int encode_heic(const char *path, const Image *img, int quality) {
     uint8_t *plane;
     int stride = 0;
     int y;
+    int effective_quality = quality;
+
+    if (shrink && effective_quality > 70) {
+        effective_quality = 70;
+    }
 
     ctx = heif_context_alloc();
     if (!ctx) {
@@ -850,7 +969,7 @@ static int encode_heic(const char *path, const Image *img, int quality) {
         return 0;
     }
 
-    heif_encoder_set_lossy_quality(encoder, quality);
+    heif_encoder_set_lossy_quality(encoder, effective_quality);
 
     err = heif_image_create(img->width, img->height, heif_colorspace_RGB, heif_chroma_interleaved_RGBA, &image);
     if (err.code != heif_error_Ok) {
@@ -933,20 +1052,20 @@ static int decode_image(const char *path, ImageFormat fmt, Image *out) {
     }
 }
 
-static int encode_image(const char *path, ImageFormat fmt, const Image *img, int quality) {
+static int encode_image(const char *path, ImageFormat fmt, const Image *img, int quality, int shrink) {
     switch (fmt) {
         case FORMAT_JPEG:
-            return encode_jpeg(path, img, quality);
+            return encode_jpeg(path, img, quality, shrink);
         case FORMAT_PNG:
-            return encode_png(path, img);
+            return encode_png(path, img, shrink);
         case FORMAT_WEBP:
-            return encode_webp(path, img, quality);
+            return encode_webp(path, img, quality, shrink);
         case FORMAT_TIFF:
-            return encode_tiff(path, img);
+            return encode_tiff(path, img, shrink);
         case FORMAT_GIF:
             return encode_gif(path, img);
         case FORMAT_HEIC:
-            return encode_heic(path, img, quality);
+            return encode_heic(path, img, quality, shrink);
         default:
             fprintf(stderr, "unsupported output format\n");
             return 0;
@@ -956,11 +1075,20 @@ static int encode_image(const char *path, ImageFormat fmt, const Image *img, int
 int main(int argc, char *argv[]) {
     int i = 1;
     int quality = 90;
+    int shrink = 0;
+    int resize_requested = 0;
+    int resize_width = 0;
+    int resize_height = 0;
     const char *input_path;
     const char *output_path;
     ImageFormat input_fmt;
     ImageFormat output_fmt;
     Image img;
+    Image final_img;
+    Image *img_to_write = NULL;
+
+    memset(&img, 0, sizeof(img));
+    memset(&final_img, 0, sizeof(final_img));
 
     while (i < argc && argv[i][0] == '-') {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -968,9 +1096,9 @@ int main(int argc, char *argv[]) {
             return 0;
         }
 
-        if (strcmp(argv[i], "-q") == 0) {
+        if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quality") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "-q requires an argument\n");
+                fprintf(stderr, "%s requires an argument\n", argv[i]);
                 return 2;
             }
             if (!parse_quality(argv[i + 1], &quality)) {
@@ -978,6 +1106,26 @@ int main(int argc, char *argv[]) {
                 return 2;
             }
             i += 2;
+            continue;
+        }
+
+        if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resize") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s requires an argument\n", argv[i]);
+                return 2;
+            }
+            if (!parse_resize(argv[i + 1], &resize_width, &resize_height)) {
+                fprintf(stderr, "invalid resize value: %s\n", argv[i + 1]);
+                return 2;
+            }
+            resize_requested = 1;
+            i += 2;
+            continue;
+        }
+
+        if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--shrink") == 0) {
+            shrink = 1;
+            i += 1;
             continue;
         }
 
@@ -1008,11 +1156,23 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (!encode_image(output_path, output_fmt, &img, quality)) {
+    if (resize_requested) {
+        if (!resize_image(&img, &final_img, resize_width, resize_height)) {
+            image_free(&img);
+            return 1;
+        }
+        img_to_write = &final_img;
+    } else {
+        img_to_write = &img;
+    }
+
+    if (!encode_image(output_path, output_fmt, img_to_write, quality, shrink)) {
+        image_free(&final_img);
         image_free(&img);
         return 1;
     }
 
+    image_free(&final_img);
     image_free(&img);
     return 0;
 }
